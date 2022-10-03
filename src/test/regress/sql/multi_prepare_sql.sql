@@ -241,6 +241,7 @@ EXECUTE prepared_partition_column_insert(6);
 
 -- suppress notice message caused by DROP ... CASCADE to prevent pg version difference
 SET client_min_messages TO 'WARNING';
+ALTER TABLE router_executor_table DROP COLUMN stats;
 DROP TYPE test_composite_type CASCADE;
 RESET client_min_messages;
 
