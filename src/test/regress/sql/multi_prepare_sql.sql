@@ -643,6 +643,25 @@ WHERE shardid IN (
 EXECUTE countsome; -- should indicate replanning
 EXECUTE countsome; -- no replanning
 
+-- Standard planner converted text and varchar casts to cstring in some cases
+-- We make sure we convert it back to text when parsing the expression
+-- https://github.com/citusdata/citus/issues/6061
+-- https://github.com/citusdata/citus/issues/5646
+-- https://github.com/citusdata/citus/issues/5033
+
+CREATE TABLE test(t timestamptz, user_id int);
+SELECT create_distributed_table('test', 'user_id');
+
+PREPARE test_statement(text) AS
+SELECT user_id FROM test WHERE t >= $1::timestamptz ORDER BY user_id;
+
+INSERT INTO test VALUES ('2022-02-02', 0);
+INSERT INTO test VALUES ('2022-01-01', 1);
+INSERT INTO test VALUES ('2021-01-01', 2);
+
+EXECUTE test_statement('2022-01-01');
+DROP TABLE test;
+
 -- reset
 \set VERBOSITY default
 

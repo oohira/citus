@@ -28,6 +28,7 @@
 #include "access/xlog.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -69,6 +70,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_type.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
@@ -79,6 +81,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 
 /* RepartitionJoinBucketCountPerNode determines bucket amount during repartitions */
@@ -231,6 +234,8 @@ static List * FetchEqualityAttrNumsForRTEBoolExpr(BoolExpr *boolExpr);
 static List * FetchEqualityAttrNumsForList(List *nodeList);
 static int PartitionColumnIndex(Var *targetVar, List *targetList);
 static List * GetColumnOriginalIndexes(Oid relationId);
+static Node * ModifyProblematicNodes(Node *inputNode);
+static CollateExpr * RelabelTypeToCollateExpr(RelabelType *relabelType);
 
 
 /*
@@ -2638,6 +2643,7 @@ SqlTaskList(Job *job)
 	uint32 anchorRangeTableId = 0;
 
 	Query *jobQuery = job->jobQuery;
+
 	List *rangeTableList = jobQuery->rtable;
 	List *whereClauseList = (List *) jobQuery->jointree->quals;
 	List *dependentJobList = job->dependentJobList;
@@ -2691,6 +2697,9 @@ SqlTaskList(Job *job)
 	List *fragmentCombinationList = FragmentCombinationList(rangeTableFragmentsList,
 															jobQuery, dependentJobList);
 
+	/* Modify problematic RelabelType and CoerceViaIO nodes */
+	jobQuery = (Query *) ModifyProblematicNodes((Node *) jobQuery);
+
 	ListCell *fragmentCombinationCell = NULL;
 	foreach(fragmentCombinationCell, fragmentCombinationList)
 	{
@@ -2741,7 +2750,7 @@ SqlTaskList(Job *job)
  * RelabelTypeToCollateExpr converts RelabelType's into CollationExpr's.
  * With that, we will be able to pushdown COLLATE's.
  */
-CollateExpr *
+static CollateExpr *
 RelabelTypeToCollateExpr(RelabelType *relabelType)
 {
 	Assert(OidIsValid(relabelType->resultcollid));
@@ -5571,4 +5580,66 @@ TaskListHighestTaskId(List *taskList)
 	}
 
 	return highestTaskId;
+}
+
+
+/*
+ * ModifyProblematicNodes takes an input rewritten query and modifies
+ * nodes which, after going through our planner, pose a problem when
+ * deparsing. So far we have two such type of Nodes that may pose problems:
+ * RelabelType and CoerceIO nodes.
+ * Details will be written in comments in the corresponding if conditions.
+ */
+static Node *
+ModifyProblematicNodes(Node *inputNode)
+{
+	if (inputNode == NULL)
+	{
+		return NULL;
+	}
+
+	if (IsA(inputNode, RelabelType) &&
+		OidIsValid(((RelabelType *) inputNode)->resultcollid) &&
+		((RelabelType *) inputNode)->resultcollid != DEFAULT_COLLATION_OID)
+	{
+		/*
+		 * The planner converts CollateExpr to RelabelType
+		 * and here we convert back.
+		 */
+		return (Node *) RelabelTypeToCollateExpr((RelabelType *) inputNode);
+	}
+	else if (IsA(inputNode, CoerceViaIO))
+	{
+		/*
+		 * The planner converts some ::text/::varchar casts to ::cstring
+		 * and here we convert back to text because cstring is a pseudotype
+		 * and it cannot be casted to most resulttypes
+		 */
+
+		CoerceViaIO *iocoerce = (CoerceViaIO *) inputNode;
+		Node *arg = (Node *) iocoerce->arg;
+
+		if (IsA(arg, Const) && ((Const *) arg)->consttype == CSTRINGOID)
+		{
+			Const *cstringToText = (Const *) arg;
+
+			cstringToText->consttype = TEXTOID;
+			cstringToText->constlen = -1;
+
+			Type textType = typeidType(TEXTOID);
+			char *constvalue = DatumGetCString(cstringToText->constvalue);
+			cstringToText->constvalue = stringTypeDatum(textType,
+														constvalue,
+														cstringToText->consttypmod);
+			ReleaseSysCache(textType);
+			return inputNode;
+		}
+	}
+	else if (IsA(inputNode, Query))
+	{
+		return (Node *) query_tree_mutator((Query *) inputNode, ModifyProblematicNodes,
+										   NULL, QTW_DONT_COPY_QUERY);
+	}
+
+	return expression_tree_mutator(inputNode, ModifyProblematicNodes, NULL);
 }
