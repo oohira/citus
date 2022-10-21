@@ -155,9 +155,6 @@ static bool IsJoinNodeRecurring(Node *joinNode, Query *currentQuery);
 static void RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr,
 								Node *distributedNode, Query *currentQuery,
 								RecursivePlanningContext *context);
-static Query * WrapSubqueryInInnerJoin(RangeTblEntry *recurringRte, JoinExpr *joinExpr,
-                                       RangeTblEntry *joinRte,
-									   RangeTblEntry *distributedRte);
 static List * SublinkListFromWhere(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static bool ShouldRecursivelyPlanSublinks(Query *query);
@@ -184,9 +181,6 @@ static bool CteReferenceListWalker(Node *node, CteReferenceWalkerContext *contex
 static bool ContainsReferencesToOuterQueryWalker(Node *node,
 												 VarLevelsUpWalkerContext *context);
 static bool NodeContainsSubqueryReferencingOuterQuery(Node *node);
-static void TransformRelationRTEIntoSubqueryRTE(RangeTblEntry *rangeTableEntry,
-												List *requiredAttrNumbers,
-												RecursivePlanningContext *context);
 static void WrapFunctionsInSubqueries(Query *query);
 static void TransformFunctionRTE(RangeTblEntry *rangeTblEntry);
 static bool ShouldTransformRTE(RangeTblEntry *rangeTableEntry);
@@ -757,9 +751,6 @@ IsJoinNodeRecurring(Node *joinNode, Query *currentQuery)
  * of the form <recurring> LEFT JOIN <distributed>, as well as RIGHT JOIN
  * and FULL JOIN equivalents, by recursively planning the distributed
  * side of the join.
- *
- * We also optimize the query plan by performing an inner join in the
- * subquery.
  */
 static void
 RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr, Node *distributedNode,
@@ -810,79 +801,7 @@ RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr, Node *distributedNo
 		return;
 	}
 
-	/*
-	 * If the recurring node is a single RTE, we optimize the query plan
-	 * by first doing in inner join within the subquery. That way, we
-	 * can typically reduce the result set size before applying the
-	 * outer join between the recurring node and the subquery result.
-	 *
-	 * If the recurring node is a join tree, we only recursively plan
-	 * the distributed node to avoid the complications of building a
-	 * new rtable.
-	 */
-	if (IsA(recurringNode, RangeTblRef))
-	{
-		RangeTblRef *recurringRef = (RangeTblRef *) recurringNode;
-		RangeTblEntry *recurringRte = rt_fetch(recurringRef->rtindex,
-											   currentQuery->rtable);
-
-        RangeTblEntry *joinRte = rt_fetch(joinExpr->rtindex,
-                                               currentQuery->rtable);
-
-		distributedRte->subquery =
-			WrapSubqueryInInnerJoin(recurringRte, joinExpr, joinRte, distributedRte);
-	}
-
 	RecursivelyPlanSubquery(distributedRte->subquery, recursivePlanningContext);
-}
-
-
-/*
- * WrapSubqueryInInnerJoin creates a new query that joins the recurringNode
- * with the subquery.
- */
-static Query *
-WrapSubqueryInInnerJoin(RangeTblEntry *recurringRte, JoinExpr *joinExpr,
-                        RangeTblEntry *joinRte,
-						RangeTblEntry *distributedRte)
-{
-    Query *query = makeNode(Query);
-    query->commandType = CMD_SELECT;
-
-    RangeTblEntry *newRecurringRte = copyObject(recurringRte);
-    RangeTblEntry *newDistributedRte = copyObject(distributedRte);
-
-    RangeTblRef *recurringRef = makeNode(RangeTblRef);
-    recurringRef->rtindex = 1;
-
-    RangeTblRef *subqueryRef = makeNode(RangeTblRef);
-    subqueryRef->rtindex = 2;
-
-    JoinExpr *innerJoin = copyObject(joinExpr);
-    innerJoin->jointype = JOIN_INNER;
-    innerJoin->larg = (Node *) recurringRef;
-    innerJoin->rarg = (Node *) subqueryRef;
-    innerJoin->rtindex = 3;
-
-    RangeTblEntry *innerJoinRte = copyObject(joinRte);
-    innerJoinRte->jointype = JOIN_INNER;
-    innerJoinRte->rtekind = RTE_JOIN;
-
-    query->rtable = list_make3(newRecurringRte, newDistributedRte, innerJoinRte);
-
-    query->jointree = makeFromExpr(list_make1(innerJoin), NULL);
-
-	query->targetList =
-		copyObject(distributedRte->subquery->targetList);
-
-    /* indirectly created by CreateFilteredTargetListForRelation, need to fix due to SINGLE_RTE_INDEX  */
-    TargetEntry *te = NULL;
-    foreach_ptr(te, query->targetList)
-    {
-        ((Var *) te->expr)->varno = 2;
-    }
-
-    return query;
 }
 
 
@@ -1657,15 +1576,24 @@ NodeContainsSubqueryReferencingOuterQuery(Node *node)
 
 
 /*
- * TransformRelationRTEIntoSubqueryRTE replaces the input rte relation target entry
+ * ReplaceRTERelationWithRteSubquery replaces the input rte relation target entry
  * with a subquery. The function also pushes down the filters to the subquery.
+ *
+ * It then recursively plans the subquery. This subquery is wrapped with another subquery
+ * as a trick to reduce network cost, because we currently don't have an easy way to
+ * skip generating NULL's for non-required columns, and if we create (SELECT a, NULL, NULL FROM table)
+ * then this will be sent over network and NULL's also occupy some space. Instead of this we generate:
+ * (SELECT t.a, NULL, NULL FROM (SELECT a FROM table) t). The inner subquery will be recursively planned
+ * but the outer part will not be yet it will still have the NULL columns so that the query is correct.
  */
-static void
-TransformRelationRTEIntoSubqueryRTE(RangeTblEntry *rangeTableEntry,
-									List *requiredAttrNumbers,
-									RecursivePlanningContext *context)
+void
+ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
+								  List *requiredAttrNumbers,
+								  RecursivePlanningContext *context)
 {
 	Query *subquery = WrapRteRelationIntoSubquery(rangeTableEntry, requiredAttrNumbers);
+	List *outerQueryTargetList = CreateAllTargetListForRelation(rangeTableEntry->relid,
+																requiredAttrNumbers);
 
 	List *restrictionList =
 		GetRestrictInfoListForRelation(rangeTableEntry,
@@ -1696,28 +1624,7 @@ TransformRelationRTEIntoSubqueryRTE(RangeTblEntry *rangeTableEntry,
 	 * subquery being treated as inherited.
 	 */
 	rangeTableEntry->inh = false;
-}
 
-
-/*
- * ReplaceRTERelationWithRteSubquery replaces the input rte relation target entry
- * with a subquery. The function also pushes down the filters to the subquery.
- *
- * It then recursively plans the subquery. This subquery is wrapped with another subquery
- * as a trick to reduce network cost, because we currently don't have an easy way to
- * skip generating NULL's for non-required columns, and if we create (SELECT a, NULL, NULL FROM table)
- * then this will be sent over network and NULL's also occupy some space. Instead of this we generate:
- * (SELECT t.a, NULL, NULL FROM (SELECT a FROM table) t). The inner subquery will be recursively planned
- * but the outer part will not be yet it will still have the NULL columns so that the query is correct.
- */
-void
-ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
-								  List *requiredAttrNumbers,
-								  RecursivePlanningContext *context)
-{
-	TransformRelationRTEIntoSubqueryRTE(rangeTableEntry, requiredAttrNumbers, context);
-
-	/* as we created the subquery, now forcefully recursively plan it */
 	if (IsLoggableLevel(DEBUG1))
 	{
 		char *relationAndAliasName = GetRelationNameAndAliasName(rangeTableEntry);
@@ -1725,15 +1632,14 @@ ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
 								relationAndAliasName)));
 	}
 
-	bool recursivelyPlanned = RecursivelyPlanSubquery(rangeTableEntry->subquery, context);
+	/* as we created the subquery, now forcefully recursively plan it */
+	bool recursivelyPlanned = RecursivelyPlanSubquery(subquery, context);
 	if (!recursivelyPlanned)
 	{
 		ereport(ERROR, (errmsg(
 							"unexpected state: query should have been recursively planned")));
 	}
 
-	List *outerQueryTargetList = CreateAllTargetListForRelation(rangeTableEntry->relid,
-																requiredAttrNumbers);
 	Query *outerSubquery = CreateOuterSubquery(rangeTableEntry, outerQueryTargetList);
 	rangeTableEntry->subquery = outerSubquery;
 }
