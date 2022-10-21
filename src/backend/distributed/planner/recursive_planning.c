@@ -149,11 +149,11 @@ static void RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 														 colocatedJoinChecker,
 														 RecursivePlanningContext *
 														 recursivePlanningContext);
-static void RecursivelyPlanRecurringLeftJoins(Node *node, Query *currentQuery,
+static void RecursivelyPlanRecurringLeftJoins(Query *query, Node *node,
 											  RecursivePlanningContext *context);
-static bool IsJoinNodeRecurring(Node *joinNode, Query *currentQuery);
+static bool IsJoinNodeRecurring(Node *joinNode, Query *query);
 static void RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr,
-								Node *distributedNode, Query *currentQuery,
+								Node *distributedNode, Query *query,
 								RecursivePlanningContext *context);
 static List * SublinkListFromWhere(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
@@ -365,7 +365,18 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanLocalTableJoins(query, context);
 	}
 
-	RecursivelyPlanRecurringLeftJoins((Node *) query->jointree, query, context);
+	/*
+	 * Similarly, logical planner cannot handle outer joins when the outer rel
+	 * is recurring, such as "<recurring>" LEFT JOIN <distributed>. In that case,
+	 * we convert distributed table into a subquery and recursively plan the outer
+	 * join. That way, inner rel gets converted into an intermediate result and
+	 * logical planner can handle the new query since it's of the from
+	 * "<recurring>" LEFT JOIN "<recurring>".
+	 *
+	 * See DeferredErrorIfUnsupportedRecurringTuplesJoin for the supported join
+	 * types.
+	 */
+	RecursivelyPlanRecurringLeftJoins(query, (Node *) query->jointree, context);
 
 	return NULL;
 }
@@ -607,11 +618,15 @@ RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 
 
 /*
- * RecursivelyPlanRecurringLeftJoins
+ * RecursivelyPlanRecurringLeftJoins descends into a join tree and recursively
+ * plans all non-recurring rels that that participate in an outer join expression
+ * as an inner rel, such "<recurring>" LEFT JOIN <distributed>.
+ *
+ * See IsJoinNodeRecurring for more details about how we decide whether an outer
+ * join needs to be recursively planned.
  */
 static void
-RecursivelyPlanRecurringLeftJoins(Node *node,
-								  Query *currentQuery,
+RecursivelyPlanRecurringLeftJoins(Query *query, Node *node,
 								  RecursivePlanningContext *recursivePlanningContext)
 {
 	if (node == NULL)
@@ -627,7 +642,7 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
 		{
 			Node *fromElement = (Node *) lfirst(fromExprCell);
 
-			RecursivelyPlanRecurringLeftJoins(fromElement, currentQuery,
+			RecursivelyPlanRecurringLeftJoins(query, fromElement,
 											  recursivePlanningContext);
 		}
 	}
@@ -642,13 +657,13 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
 		{
 			case JOIN_LEFT:
 			{
-				bool leftNodeRecurs = IsJoinNodeRecurring(leftNode, currentQuery);
-				bool rightNodeRecurs = IsJoinNodeRecurring(rightNode, currentQuery);
+				bool leftNodeRecurs = IsJoinNodeRecurring(leftNode, query);
+				bool rightNodeRecurs = IsJoinNodeRecurring(rightNode, query);
 
-				/* only <recurring> left join <distributed> */
+				/* <recurring> left join <distributed> */
 				if (leftNodeRecurs && !rightNodeRecurs)
 				{
-					RecursivelyPlanJoin(leftNode, joinExpr, rightNode, currentQuery,
+					RecursivelyPlanJoin(leftNode, joinExpr, rightNode, query,
 										recursivePlanningContext);
 					return;
 				}
@@ -658,13 +673,13 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
 
 			case JOIN_RIGHT:
 			{
-				bool leftNodeRecurs = IsJoinNodeRecurring(leftNode, currentQuery);
-				bool rightNodeRecurs = IsJoinNodeRecurring(rightNode, currentQuery);
+				bool leftNodeRecurs = IsJoinNodeRecurring(leftNode, query);
+				bool rightNodeRecurs = IsJoinNodeRecurring(rightNode, query);
 
-				/* only <distributed> right join <recurring> */
+				/* <distributed> right join <recurring> */
 				if (!leftNodeRecurs && rightNodeRecurs)
 				{
-					RecursivelyPlanJoin(rightNode, joinExpr, leftNode, currentQuery,
+					RecursivelyPlanJoin(rightNode, joinExpr, leftNode, query,
 										recursivePlanningContext);
 					return;
 				}
@@ -674,8 +689,8 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
 
 			case JOIN_FULL:
 			{
-				bool leftNodeRecurs = IsJoinNodeRecurring(leftNode, currentQuery);
-				bool rightNodeRecurs = IsJoinNodeRecurring(rightNode, currentQuery);
+				bool leftNodeRecurs = IsJoinNodeRecurring(leftNode, query);
+				bool rightNodeRecurs = IsJoinNodeRecurring(rightNode, query);
 
 				/*
 				 * <recurring> full join <distributed>
@@ -683,13 +698,13 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
 				 */
 				if (leftNodeRecurs && !rightNodeRecurs)
 				{
-					RecursivelyPlanJoin(leftNode, joinExpr, rightNode, currentQuery,
+					RecursivelyPlanJoin(leftNode, joinExpr, rightNode, query,
 										recursivePlanningContext);
 					return;
 				}
 				else if (!leftNodeRecurs && rightNodeRecurs)
 				{
-					RecursivelyPlanJoin(rightNode, joinExpr, leftNode, currentQuery,
+					RecursivelyPlanJoin(rightNode, joinExpr, leftNode, query,
 										recursivePlanningContext);
 					return;
 				}
@@ -697,17 +712,22 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
 				break;
 			}
 
-			case JOIN_INNER:
+            /* TODO: any other join types that we specially need to take care of ? */
+
 			default:
 			{
+                /*
+                 * We don't need to recursive plan non-outer joins but might need
+                 * to do so recursively; so we fallthrough here..
+                 */
 				break;
 			}
 		}
 
 		/* there may be recursively plannable outer joins deeper in the join tree */
-		RecursivelyPlanRecurringLeftJoins(joinExpr->larg, currentQuery,
+		RecursivelyPlanRecurringLeftJoins(query, joinExpr->larg,
 										  recursivePlanningContext);
-		RecursivelyPlanRecurringLeftJoins(joinExpr->rarg, currentQuery,
+		RecursivelyPlanRecurringLeftJoins(query, joinExpr->rarg,
 										  recursivePlanningContext);
 	}
 }
@@ -724,23 +744,23 @@ RecursivelyPlanRecurringLeftJoins(Node *node,
  * references an RTE that does not contain a distributed table.
  */
 static bool
-IsJoinNodeRecurring(Node *joinNode, Query *currentQuery)
+IsJoinNodeRecurring(Node *joinNode, Query *query)
 {
 	if (IsA(joinNode, JoinExpr))
 	{
 		JoinExpr *joinExpr = (JoinExpr *) joinNode;
-		return IsJoinNodeRecurring(joinExpr->larg, currentQuery) &&
-			   IsJoinNodeRecurring(joinExpr->rarg, currentQuery);
+		return IsJoinNodeRecurring(joinExpr->larg, query) &&
+			   IsJoinNodeRecurring(joinExpr->rarg, query);
 	}
 
 	Assert(IsA(joinNode, RangeTblRef));
 
 	RangeTblRef *rangeTableRef = (RangeTblRef *) joinNode;
 	int rangeTableIndex = rangeTableRef->rtindex;
-	List *rangeTableList = currentQuery->rtable;
+	List *rangeTableList = query->rtable;
 	RangeTblEntry *rangeTableEntry = rt_fetch(rangeTableIndex, rangeTableList);
 
-    /* decide as in RelationInfoContainsOnlyRecurringTuples */
+	/* decide as in RelationInfoContainsOnlyRecurringTuples */
 	return !FindNodeMatchingCheckFunctionInRangeTableList(list_make1(rangeTableEntry),
 														  IsDistributedTableRTE);
 }
@@ -753,8 +773,8 @@ IsJoinNodeRecurring(Node *joinNode, Query *currentQuery)
  * side of the join.
  */
 static void
-RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr, Node *distributedNode,
-					Query *currentQuery,
+RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr,
+					Node *distributedNode, Query *query,
 					RecursivePlanningContext *recursivePlanningContext)
 {
 	if (IsA(distributedNode, JoinExpr))
@@ -778,7 +798,7 @@ RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr, Node *distributedNo
 
 	RangeTblRef *distributedRef = (RangeTblRef *) distributedNode;
 	RangeTblEntry *distributedRte = rt_fetch(distributedRef->rtindex,
-											 currentQuery->rtable);
+											 query->rtable);
 
 	if (distributedRte->rtekind == RTE_RELATION)
 	{
@@ -789,19 +809,11 @@ RecursivelyPlanJoin(Node *recurringNode, JoinExpr *joinExpr, Node *distributedNo
 		List *requiredAttributes =
 			RequiredAttrNumbersForRelation(distributedRte, restrictionContext);
 
-		TransformRelationRTEIntoSubqueryRTE(distributedRte, requiredAttributes,
-											recursivePlanningContext);
-	}
-	else if (distributedRte->rtekind != RTE_SUBQUERY)
-	{
-		/*
-		 * Ignore other RTEs for now, e.g. a function RTE could still be
-		 * distributed if one of its arguments is a sublink.
-		 */
-		return;
+		ReplaceRTERelationWithRteSubquery(distributedRte, requiredAttributes,
+										  recursivePlanningContext);
 	}
 
-	RecursivelyPlanSubquery(distributedRte->subquery, recursivePlanningContext);
+	/* TODO: what about other RTE kinds ? */
 }
 
 
